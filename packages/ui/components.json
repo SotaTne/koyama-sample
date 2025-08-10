@@ -11,10 +11,10 @@
   },
   "iconLibrary": "lucide",
   "aliases": {
-    "components": "@workspace/ui/components",
-    "utils": "@workspace/ui/lib/utils",
-    "hooks": "@workspace/ui/hooks",
-    "lib": "@workspace/ui/lib",
-    "ui": "@workspace/ui/components"
+    "components": "@kyosan-map/ui/components",
+    "utils": "@kyosan-map/ui/lib/utils",
+    "hooks": "@kyosan-map/ui/hooks",
+    "lib": "@kyosan-map/ui/lib",
+    "ui": "@kyosan-map/ui/components"
   }
 }

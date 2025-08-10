@@ -1,3 +1,3 @@
-# `@workspace/eslint-config`
+# `@kyosan-map/eslint-config`
 
 Shared eslint configuration for the workspace.
