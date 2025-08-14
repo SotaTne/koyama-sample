@@ -1,11 +1,15 @@
 {
-  "extends": "@kyosan-map/typescript-config/nextjs.json",
+  "extends": "@kyosan-map/typescript-config/react-library.json",
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
       "@kyosan-map/out-camera/*": ["./src/*"]
-    }
+    },
+    "declaration": true,
+    "declarationDir": "dist/types",
+    "emitDeclarationOnly": true,
+    "typeRoots": ["./src/types", "./node_modules/@types"]
   },
-  "include": ["."],
+  "include": ["src/**/*"], 
   "exclude": ["node_modules", "dist"]
 }
