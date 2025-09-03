@@ -1,0 +1,13 @@
+services:
+  # ONNX変換用サービス
+  to_onnx:
+    build:
+      context: .
+      dockerfile: to_onnx_Dockerfile
+      target: to_onnx
+    volumes:
+      - ./models/onnx:/app/models/onnx
+    environment:
+      - MODEL_DIR=/root/.paddlex/official_models
+      - ONNX_DIR=/app/models/onnx
+      - OPSET_VERSION=21

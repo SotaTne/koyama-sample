@@ -1,6 +1,6 @@
 "use client";
 
-import { ReactNode, useState, useEffect, useMemo } from "react";
+import { ReactNode, useState, useEffect } from "react";
 import { ImagePreprocessContext } from "../contexts/preprocess-context";
 import { ImageRecognizerContext } from "../contexts/recognizer-context";
 import { ImagePreprocessor } from "../lib/image-preprocess";
@@ -12,7 +12,7 @@ export function ClientImageProvider({ children }: { children: ReactNode }) {
   const [preprocessor, setPreprocessor] = useState<ImagePreprocessor | null>(null);
   const [recognizer, setRecognizer] = useState<Recognizer | null>(null);
   const { cv } = useOpenCv();
-
+  
   useEffect(() => {
     if (cv) {
       setPreprocessor(new ImagePreprocessor(cv));

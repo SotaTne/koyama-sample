@@ -1,0 +1,52 @@
+FROM python:3.12-slim AS base
+
+# 環境変数の設定
+ENV MODEL_DIR="/root/.paddlex/official_models"
+ENV ONNX_DIR="/app/models/onnx"
+ENV OPSET_VERSION=21
+
+WORKDIR /usr/src/app
+
+# システム依存関係のインストール
+RUN apt-get update && apt-get install -y \
+    libglib2.0-0 libsm6 libxrender1 libxext6 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pythonとpipのアップグレード
+RUN python -m ensurepip --upgrade && \
+    python -m pip install --upgrade pip
+
+# 依存関係を先にインストール（キャッシュ効率化）
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+
+# =============================================================================
+
+FROM base AS init
+
+# ソースファイルをコピーしてからinit実行
+COPY src/ ./src/
+RUN python src/init.py
+
+# =============================================================================
+
+FROM base AS to_onnx
+
+# initステージからモデルをコピー
+COPY --from=init ${MODEL_DIR} ${MODEL_DIR}
+COPY convert_models.sh ./
+
+# 実行権限を付与
+RUN chmod +x convert_models.sh
+
+# PaddleXのインストール
+RUN pip install "paddlex[base]"
+
+RUN paddlex --install paddle2onnx
+
+# 必要なディレクトリを作成
+RUN mkdir -p ${ONNX_DIR}
+
+# ONNX変換の実行
+CMD ["sh", "-c", "./convert_models.sh ${MODEL_DIR} ${ONNX_DIR}"]
