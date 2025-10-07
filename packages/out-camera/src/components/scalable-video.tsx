@@ -68,15 +68,39 @@ export function WebGLCanvasCamera({
 
   const [meta, setMeta] = useState<{ vw: number; vh: number } | null>(null);
   const layoutRef = useRef<CameraLayout | null>(null);
-  const lastUVRef = useRef<{ u0: number; v0: number; u1: number; v1: number } | null>(null);
+  const lastUVRef = useRef<{
+    u0: number;
+    v0: number;
+    u1: number;
+    v1: number;
+  } | null>(null);
   const cachedRef = useRef({ cw: 0, ch: 0, dpr: 1 });
   const pixRef = useRef({ w: 0, h: 0 });
   const allocTexRef = useRef<{ w: number; h: number } | null>(null);
   const isRenderingRef = useRef(true);
   const contextLostRef = useRef(false);
 
+  // ====== ここから: ストリームAPIズーム状態 ======
+  const zoomStateRef = useRef<{
+    supported: boolean;
+    min: number;
+    max: number;
+    step: number;
+    value: number;
+  }>({ supported: false, min: 1, max: 1, step: 0.01, value: 1 });
+
+  const desiredZoomRef = useRef<number | null>(null);
+  const zoomApplyScheduledRef = useRef(false);
+  const pinchActiveRef = useRef(false);
+  const skipTapUntilRef = useRef(0);
+  // ====== ここまで ======
+
   // Compile & link helpers
-  const compileShader = (gl: WebGL2RenderingContext, type: number, source: string) => {
+  const compileShader = (
+    gl: WebGL2RenderingContext,
+    type: number,
+    source: string
+  ) => {
     const sh = gl.createShader(type);
     if (!sh) throw new Error("Failed to create shader");
     gl.shaderSource(sh, source);
@@ -89,7 +113,11 @@ export function WebGLCanvasCamera({
     return sh;
   };
 
-  const linkProgram = (gl: WebGL2RenderingContext, vs: WebGLShader, fs: WebGLShader) => {
+  const linkProgram = (
+    gl: WebGL2RenderingContext,
+    vs: WebGLShader,
+    fs: WebGLShader
+  ) => {
     const prog = gl.createProgram();
     if (!prog) throw new Error("Failed to create program");
     gl.attachShader(prog, vs);
@@ -107,11 +135,21 @@ export function WebGLCanvasCamera({
 
   // Layout
   const calcLayout = useCallback(
-    (vw: number, vh: number, cw: number, ch: number, dpr: number, ovVal: number): CameraLayout => {
+    (
+      vw: number,
+      vh: number,
+      cw: number,
+      ch: number,
+      dpr: number,
+      ovVal: number
+    ): CameraLayout => {
       const ov = Math.max(1, ovVal);
       const rc = cw / ch;
       const rv = vw / vh;
-      let sx = 0, sy = 0, sw = vw, sh = vh;
+      let sx = 0,
+        sy = 0,
+        sw = vw,
+        sh = vh;
 
       if (rv > rc) {
         sw = vh * rc;
@@ -131,7 +169,7 @@ export function WebGLCanvasCamera({
     []
   );
 
-  // Update UV (no gl.useProgram here)
+  // Update UV
   const updateUV = useCallback(
     (gl: WebGL2RenderingContext, L: CameraLayout, vw: number, vh: number) => {
       if (!uUVRectRef.current) return;
@@ -143,7 +181,14 @@ export function WebGLCanvasCamera({
       const v1 = 1.0 - (L.sy + L.sh) * invH;
 
       const last = lastUVRef.current;
-      if (last && last.u0 === u0 && last.v0 === v0 && last.u1 === u1 && last.v1 === v1) return;
+      if (
+        last &&
+        last.u0 === u0 &&
+        last.v0 === v0 &&
+        last.u1 === u1 &&
+        last.v1 === v1
+      )
+        return;
 
       gl.uniform4f(uUVRectRef.current, u0, v0, u1, v1);
       lastUVRef.current = { u0, v0, u1, v1 };
@@ -172,9 +217,11 @@ export function WebGLCanvasCamera({
     contextLostRef.current = false;
 
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    // Disable implicit color conversion (best-effort; some UAs ignore).
     try {
-      (gl as any).pixelStorei((gl as any).UNPACK_COLORSPACE_CONVERSION_WEBGL, (gl as any).NONE);
+      (gl as any).pixelStorei(
+        (gl as any).UNPACK_COLORSPACE_CONVERSION_WEBGL,
+        (gl as any).NONE
+      );
     } catch {}
 
     gl.disable(gl.DEPTH_TEST);
@@ -189,7 +236,8 @@ export function WebGLCanvasCamera({
     gl.useProgram(prog);
     const uTex = gl.getUniformLocation(prog, "u_texture");
     uUVRectRef.current = gl.getUniformLocation(prog, "u_uvRect");
-    if (!uTex || !uUVRectRef.current) throw new Error("Uniform locations not found");
+    if (!uTex || !uUVRectRef.current)
+      throw new Error("Uniform locations not found");
     gl.uniform1i(uTex, 0);
 
     const vao = gl.createVertexArray();
@@ -262,7 +310,7 @@ export function WebGLCanvasCamera({
     };
   }, [initGL2]);
 
-  // MediaStream
+  // MediaStream + ズーム機能サポート検出
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
@@ -273,19 +321,48 @@ export function WebGLCanvasCamera({
     v.autoplay = true;
 
     const onMeta = () => {
-      if (v.videoWidth && v.videoHeight) setMeta({ vw: v.videoWidth, vh: v.videoHeight });
+      if (v.videoWidth && v.videoHeight)
+        setMeta({ vw: v.videoWidth, vh: v.videoHeight });
     };
     const onCanPlay = () => v.play().catch(() => {});
     const onEnded = () => (isRenderingRef.current = false);
 
     const tracks = stream.getVideoTracks();
-    tracks.forEach((t) => t.addEventListener("ended", onEnded));
+    const track = tracks[0];
 
+    // ズーム可否＆範囲
+    if (track && typeof (track as any).getCapabilities === "function") {
+      try {
+        const caps: any = (track as any).getCapabilities();
+        const sets: any = (track as any).getSettings?.() ?? {};
+        if (caps && "zoom" in caps) {
+          zoomStateRef.current.supported = true;
+          zoomStateRef.current.min = caps.zoom?.min ?? 1;
+          zoomStateRef.current.max =
+            caps.zoom?.max ?? Math.max(1, sets.zoom ?? 1);
+          zoomStateRef.current.step = caps.zoom?.step ?? 0.01;
+          zoomStateRef.current.value = sets.zoom ?? 1;
+        } else {
+          zoomStateRef.current.supported = false;
+        }
+      } catch (e) {
+        console.warn("[WebGLCanvasCamera] getCapabilities failed:", e);
+        zoomStateRef.current.supported = false;
+      }
+    } else {
+      zoomStateRef.current.supported = false;
+    }
+
+    tracks.forEach((t) => t.addEventListener("ended", onEnded));
     v.addEventListener("loadedmetadata", onMeta);
     v.addEventListener("loadeddata", onMeta);
     v.addEventListener("canplay", onCanPlay);
 
-    if (v.readyState >= HTMLMediaElement.HAVE_METADATA && v.videoWidth && v.videoHeight) {
+    if (
+      v.readyState >= HTMLMediaElement.HAVE_METADATA &&
+      v.videoWidth &&
+      v.videoHeight
+    ) {
       setMeta({ vw: v.videoWidth, vh: v.videoHeight });
       v.play().catch(() => {});
     }
@@ -311,7 +388,8 @@ export function WebGLCanvasCamera({
         const dpr = window.devicePixelRatio || 1;
 
         const cached = cachedRef.current;
-        if (cached.cw === cw && cached.ch === ch && cached.dpr === dpr) continue;
+        if (cached.cw === cw && cached.ch === ch && cached.dpr === dpr)
+          continue;
 
         cachedRef.current = { cw, ch, dpr };
 
@@ -330,7 +408,6 @@ export function WebGLCanvasCamera({
         const L = calcLayout(meta.vw, meta.vh, cw, ch, dpr, overscan);
         layoutRef.current = L;
 
-        // Ensure correct program bound at least once (init & render will bind too)
         gl.useProgram(progRef.current!);
         updateUV(gl, L, meta.vw, meta.vh);
       }
@@ -367,7 +444,6 @@ export function WebGLCanvasCamera({
       return;
     }
 
-    // Allocate/resize video texture only when needed
     const sizeChanged =
       !allocTexRef.current ||
       allocTexRef.current.w !== v.videoWidth ||
@@ -386,9 +462,25 @@ export function WebGLCanvasCamera({
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       try {
-        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, v.videoWidth, v.videoHeight);
+        gl.texStorage2D(
+          gl.TEXTURE_2D,
+          1,
+          gl.RGBA8,
+          v.videoWidth,
+          v.videoHeight
+        );
       } catch {
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, v.videoWidth, v.videoHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA8,
+          v.videoWidth,
+          v.videoHeight,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          null
+        );
       }
       allocTexRef.current = { w: v.videoWidth, h: v.videoHeight };
     } else {
@@ -396,7 +488,6 @@ export function WebGLCanvasCamera({
       gl.bindTexture(gl.TEXTURE_2D, texRef.current);
     }
 
-    // Upload frame
     try {
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, v);
     } catch {
@@ -406,7 +497,6 @@ export function WebGLCanvasCamera({
       return;
     }
 
-    // Draw
     gl.useProgram(prog);
     gl.bindVertexArray(vao);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -444,8 +534,12 @@ export function WebGLCanvasCamera({
     };
   }, [render]);
 
-  // Capture target
-  const ensureCaptureTarget = (gl: WebGL2RenderingContext, w: number, h: number) => {
+  // Capture target (for snapshot)
+  const ensureCaptureTarget = (
+    gl: WebGL2RenderingContext,
+    w: number,
+    h: number
+  ) => {
     const need =
       !captureSizeRef.current ||
       captureSizeRef.current.w !== w ||
@@ -460,20 +554,36 @@ export function WebGLCanvasCamera({
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    // NEAREST is enough for offscreen capture
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     try {
       gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
     } catch {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA8,
+        w,
+        h,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        null
+      );
     }
 
     const fbo = gl.createFramebuffer()!;
     captureFBORef.current = fbo;
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      tex,
+      0
+    );
+    const ok =
+      gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     if (!ok) {
       gl.deleteTexture(tex);
@@ -500,13 +610,15 @@ export function WebGLCanvasCamera({
     const h = Math.round(L.ch * L.dpr);
     ensureCaptureTarget(gl, w, h);
 
-    // Save state
-    const prevFB = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
+    const prevFB = gl.getParameter(
+      gl.FRAMEBUFFER_BINDING
+    ) as WebGLFramebuffer | null;
     const prevVP = gl.getParameter(gl.VIEWPORT) as Int32Array;
     const prevProg = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
-    const prevVAO = gl.getParameter(gl.VERTEX_ARRAY_BINDING) as WebGLVertexArrayObject | null;
+    const prevVAO = gl.getParameter(
+      gl.VERTEX_ARRAY_BINDING
+    ) as WebGLVertexArrayObject | null;
 
-    // Offscreen draw
     gl.bindFramebuffer(gl.FRAMEBUFFER, captureFBORef.current);
     gl.viewport(0, 0, w, h);
     gl.activeTexture(gl.TEXTURE0);
@@ -516,18 +628,15 @@ export function WebGLCanvasCamera({
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.bindVertexArray(null);
 
-    // Readback
     gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
     const src = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, src);
 
-    // Restore state
     gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
     gl.viewport(prevVP[0]!, prevVP[1]!, prevVP[2]!, prevVP[3]!);
     gl.useProgram(prevProg);
     gl.bindVertexArray(prevVAO);
 
-    // Flip Y
     const row = w * 4;
     const dst = new Uint8ClampedArray(src.length);
     for (let y = 0; y < h; y++) {
@@ -543,17 +652,165 @@ export function WebGLCanvasCamera({
     }
   }, []);
 
-  // Tap handler
+  // ====== ここから: ズーム適用ロジック（ホイール＆ピンチ） ======
+  const applyZoomScheduled = useCallback(() => {
+    if (zoomApplyScheduledRef.current) return;
+    zoomApplyScheduledRef.current = true;
+    requestAnimationFrame(async () => {
+      zoomApplyScheduledRef.current = false;
+      const z = desiredZoomRef.current;
+      if (z == null) return;
+
+      const track = stream.getVideoTracks()[0];
+      if (!track) return;
+
+      try {
+        // どちらか通る方で
+        // @ts-ignore
+        await track.applyConstraints({ advanced: [{ zoom: z as any }] });
+      } catch {
+        try {
+          await track.applyConstraints({ zoom: z as any } as any);
+        } catch (e2) {
+          console.warn(
+            "[WebGLCanvasCamera] applyConstraints(zoom) failed:",
+            e2
+          );
+          // 以後のズームは無効化
+          zoomStateRef.current.supported = false;
+          return;
+        }
+      }
+      zoomStateRef.current.value = z;
+    });
+  }, [stream]);
+
+  // clamp helper
+  const clamp = (v: number, mn: number, mx: number) =>
+    Math.min(mx, Math.max(mn, v));
+
+  // ネイティブイベント: wheel + pointer(pinch)
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+
+    const wheelHandler = (ev: WheelEvent) => {
+      const zs = zoomStateRef.current;
+      if (!zs.supported) return;
+
+      ev.preventDefault(); // ページスクロール抑止
+      // スケール係数（自然な感触に）
+      const scale = Math.exp(-ev.deltaY * 0.002);
+      const next = clamp(zs.value * scale, zs.min, zs.max);
+      if (Math.abs(next - zs.value) < (zs.step || 0.001)) return;
+      desiredZoomRef.current = next;
+      applyZoomScheduled();
+      // ホイールはタップ扱いにしない
+      skipTapUntilRef.current = performance.now() + 200;
+    };
+
+    // ピンチ状態
+    const touches = new Map<number, { x: number; y: number }>();
+    let initialDist = 0;
+    let initialZoom = 1;
+
+    const distance = (
+      a: { x: number; y: number },
+      b: { x: number; y: number }
+    ) => Math.hypot(a.x - b.x, a.y - b.y);
+
+    const pointerDown = (ev: PointerEvent) => {
+      const zs = zoomStateRef.current;
+      if (ev.pointerType !== "touch") return; // ピンチのみ
+      if (!zs.supported) return;
+
+      (ev.target as Element).setPointerCapture?.(ev.pointerId);
+      touches.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+      if (touches.size === 2) {
+        const [a, b] = Array.from(touches.values());
+        initialDist = distance(a!, b!);
+        initialZoom = zs.value;
+        pinchActiveRef.current = true;
+        skipTapUntilRef.current = performance.now() + 400;
+      }
+    };
+
+    const pointerMove = (ev: PointerEvent) => {
+      const zs = zoomStateRef.current;
+      if (ev.pointerType !== "touch") return;
+      if (!zs.supported) return;
+      if (!touches.has(ev.pointerId)) return;
+
+      touches.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+      if (touches.size === 2 && initialDist > 0) {
+        const [a, b] = Array.from(touches.values());
+        const dist = distance(a!, b!);
+        if (dist <= 0) return;
+        const ratio = dist / initialDist;
+        const next = clamp(initialZoom * ratio, zs.min, zs.max);
+        if (Math.abs(next - zs.value) >= (zs.step || 0.001)) {
+          desiredZoomRef.current = next;
+          applyZoomScheduled();
+        }
+      }
+    };
+
+    const endPinchIfNeeded = () => {
+      if (touches.size < 2) {
+        pinchActiveRef.current = false;
+        initialDist = 0;
+        skipTapUntilRef.current = performance.now() + 250;
+      }
+    };
+
+    const pointerUp = (ev: PointerEvent) => {
+      if (ev.pointerType === "touch") {
+        touches.delete(ev.pointerId);
+        endPinchIfNeeded();
+      }
+    };
+    const pointerCancel = (ev: PointerEvent) => {
+      if (ev.pointerType === "touch") {
+        touches.delete(ev.pointerId);
+        endPinchIfNeeded();
+      }
+    };
+
+    el.addEventListener("wheel", wheelHandler, { passive: false });
+    el.addEventListener("pointerdown", pointerDown, { passive: false });
+    el.addEventListener("pointermove", pointerMove, { passive: false });
+    el.addEventListener("pointerup", pointerUp);
+    el.addEventListener("pointercancel", pointerCancel);
+
+    return () => {
+      el.removeEventListener("wheel", wheelHandler as any);
+      el.removeEventListener("pointerdown", pointerDown as any);
+      el.removeEventListener("pointermove", pointerMove as any);
+      el.removeEventListener("pointerup", pointerUp as any);
+      el.removeEventListener("pointercancel", pointerCancel as any);
+    };
+  }, [applyZoomScheduled]);
+  // ====== ここまで: ズーム適用ロジック ======
+
+  // Tap handler（ピンチ直後の誤タップ抑止）
   const onPointerUp: React.PointerEventHandler<HTMLCanvasElement> = useCallback(
     (e) => {
       if (!onTap || !layoutRef.current) return;
+      if (performance.now() < skipTapUntilRef.current || pinchActiveRef.current)
+        return;
+
       const cvs = canvasRef.current!;
       const rect = cvs.getBoundingClientRect();
       const L = layoutRef.current;
       const xCss = e.clientX - rect.left;
       const yCss = e.clientY - rect.top;
       const cx = Math.max(0, Math.min(cvs.width - 1, Math.round(xCss * L.dpr)));
-      const cy = Math.max(0, Math.min(cvs.height - 1, Math.round(yCss * L.dpr)));
+      const cy = Math.max(
+        0,
+        Math.min(cvs.height - 1, Math.round(yCss * L.dpr))
+      );
 
       const imageData = makeSnapshotImageData();
       if (!imageData) return;
@@ -572,7 +829,8 @@ export function WebGLCanvasCamera({
         position: "relative",
         overflow: "hidden",
         background: "black",
-        touchAction: "manipulation",
+        // ピンチを自前処理するため none 推奨
+        touchAction: "none",
       }}
     >
       <canvas
