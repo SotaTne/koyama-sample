@@ -1,7 +1,6 @@
 {
   "extends": "@kyosan-map/typescript-config/nextjs.json",
   "compilerOptions": {
-    "baseUrl": ".",
     "paths": {
       "@kyosan-map/collections/*": ["./src/*"]
     }

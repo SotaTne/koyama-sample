@@ -1,223 +1,253 @@
-"use client"
+"use client";
 
-import { useImagePreprocessor } from '@kyosan-map/out-camera/hooks/preprocess-hook';
-import { useImageRecognizer } from '@kyosan-map/out-camera/hooks/recognizer-hook';
-import { useStream } from '@kyosan-map/out-camera/hooks/stream-hook';
-import { useRef, useEffect, useState, useCallback } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useRef,
+} from "react";
 
-export function CameraProvider() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const resultCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [tapPosition, setTapPosition] = useState<{ x: number; y: number } | null>(null);
-  const imagePreprocess = useImagePreprocessor();
-  const imageRecognizer = useImageRecognizer();
-  const stream = useStream();
+import { WebGLCanvasCamera } from "@kyosan-map/out-camera/components/scalable-video";
+import { useImageRecognizer } from "@kyosan-map/out-camera/hooks/recognizer-hook";
+import { findNearestOCRBox } from "@kyosan-map/out-camera/functions/box_distance";
+import { ImageActionProvider } from "@kyosan-map/out-camera/components/image-action-provider";
+import type { OCRResult, Point } from "@kyosan-map/out-camera/types/type";
 
-  // カメラストリームの開始
+/**
+ * ==========================================
+ * 内部カメラコンポーネント
+ * ==========================================
+ */
+function CameraInner() {
+  const recognizer = useImageRecognizer();
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
+  const [lastResult, setLastResult] = useState<OCRResult[] | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
+  /** 🚀 カメラ開始 */
   const startCamera = useCallback(async () => {
-    if (isStreaming) return; // 既に起動中の場合は何もしない
-    
+    console.log("[startCamera] called");
+    if (isStarting || isRunning) return;
+
     try {
-      // 既存のストリームがあれば停止
-      stopCamera();
-      
-      // スマホの場合は背面カメラを優先
-      const constraints: MediaStreamConstraints = {
+      setIsStarting(true);
+      const s = await navigator.mediaDevices.getUserMedia({
         video: {
-          facingMode: { ideal: 'environment' }, // 背面カメラを優先
+          facingMode: { ideal: "environment" },
           width: { ideal: 1280 },
-          height: { ideal: 720 }
+          height: { ideal: 720 },
         },
-        audio: false
-      };
+        audio: false,
+      });
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        
-        // loadedmetadata イベントを待ってから play を呼ぶ
-        const playPromise = new Promise<void>((resolve, reject) => {
-          const video = videoRef.current!;
-          
-          const onLoadedMetadata = () => {
-            video.removeEventListener('loadedmetadata', onLoadedMetadata);
-            video.play()
-              .then(() => resolve())
-              .catch(reject);
-          };
-          
-          if (video.readyState >= 1) {
-            // 既にメタデータが読み込まれている場合
-            video.play().then(() => resolve()).catch(reject);
-          } else {
-            video.addEventListener('loadedmetadata', onLoadedMetadata);
-          }
-        });
-        
-        await playPromise;
-        setIsStreaming(true);
-        setError(null);
-      }
+      console.log("[startCamera] stream obtained:", s);
+      streamRef.current = s;
+      setStream(s);
+      setIsRunning(true);
     } catch (err) {
-      console.error('Camera access error:', err);
-      setError('カメラへのアクセスに失敗しました。カメラの許可を確認してください。');
+      console.error("[startCamera] failed:", err);
+      alert("カメラの起動に失敗しました。権限を確認してください。");
+    } finally {
+      setIsStarting(false);
     }
-  }, [isStreaming]);
+  }, [isStarting, isRunning]);
 
-  // カメラストリームの停止
+  /** 🛑 カメラ停止 */
   const stopCamera = useCallback(() => {
-    if (videoRef.current?.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach(track => track.stop());
-      videoRef.current.srcObject = null;
+    console.log("[stopCamera] called");
+    const s = streamRef.current;
+    if (s) {
+      s.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
     }
-    setIsStreaming(false);
+    setStream(null);
+    setIsRunning(false);
   }, []);
 
-  // コンポーネントマウント時にカメラを開始
+  /** 🚫 unmount時もストリームを維持（iOS Safari対策） */
   useEffect(() => {
-    let mounted = true;
-    
-    const initCamera = async () => {
-      if (mounted) {
-        await startCamera();
-      }
-    };
-    
-    initCamera();
-
-    // クリーンアップ関数
+    console.log("[CameraInner] mount");
     return () => {
-      mounted = false;
-      stopCamera();
+      console.log("[CameraInner] unmount (stream preserved)");
+      // 🔥 stream は停止しない
     };
-  }, []); // 依存配列を空にして初回のみ実行
+  }, []);
 
-  const handleVideoClick = useCallback((event: React.MouseEvent<HTMLVideoElement>) => {
-    if (!videoRef.current || !canvasRef.current || !isStreaming  || !resultCanvasRef.current) return;
+  /** 👆 タップ時のOCR処理 */
+  const handleTap = useCallback(
+    async (payload: { x: number; y: number; imageData: ImageData }) => {
+      console.log("[handleTap] payload:", payload);
 
-    try {
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const resultCanvas = resultCanvasRef.current;
-      const ctx = canvas.getContext('2d');
-      const resultCtx = resultCanvas.getContext('2d');
+      if (!recognizer) {
+        console.error("[handleTap] recognizer not ready");
+        alert(
+          "OCR がまだ初期化されていません。少し待ってから再試行してください。"
+        );
+        return;
+      }
 
-      if (!ctx || !resultCtx) throw new Error('Canvas context not available');
+      try {
+        console.log("[handleTap] OCR start");
+        const resultsRaw = await recognizer.run(payload.imageData);
 
-      // タップ位置の計算
-      const rect = video.getBoundingClientRect();
-      const scaleX = video.videoWidth / rect.width;
-      const scaleY = video.videoHeight / rect.height;
-      
-      const tapX = (event.clientX - rect.left) * scaleX;
-      const tapY = (event.clientY - rect.top) * scaleY;
-      
-      setTapPosition({ x: Math.round(tapX), y: Math.round(tapY) });
+        const results: OCRResult[] = resultsRaw[0]! as unknown as OCRResult[];
+        console.log("[handleTap] OCR results:", results);
+        setLastResult(results);
 
-      // キャンバスサイズをビデオサイズに合わせる
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+        if (!results || results.length === 0) {
+          alert("文字が検出されませんでした。");
+          return;
+        }
 
-      resultCanvas.width = video.videoWidth;
-      resultCanvas.height = video.videoHeight;
+        const tap: Point = [payload.x, payload.y];
+        const nearest = findNearestOCRBox(tap, results);
+        console.log("[handleTap] nearest:", nearest);
 
-      // ビデオフレームをキャンバスに描画
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        if (!nearest) {
+          alert("適切な領域が見つかりませんでした。");
+          return;
+        }
 
-      //imagePreprocess.processOptimized(canvas,resultCanvas);
-      //imagePreprocess.processNone(canvas,resultCanvas);
-      imagePreprocess.processWithMorphology(canvas, resultCanvas);
+        const text = nearest.text.trim();
+        const ok = window.confirm(`OCR結果は「${text}」ですか？`);
+        alert(
+          ok ? "ありがとうございます！" : "別の領域をタップしてみてください。"
+        );
+      } catch (err) {
+        console.error("[handleTap] error:", err);
+        alert("OCR 実行中にエラーが発生しました。");
+      }
+    },
+    [recognizer]
+  );
 
-      if (resultCanvas && imageRecognizer) {
-        imageRecognizer.process(resultCanvas).then((result)=>{
-          console.log('認識結果"""')
-          result.forEach((block, index)=>{
-            console.log(`Block ${index}:`, JSON.stringify(block.bbox,null,2));
-            console.log(`Block ${index}:`, block.text);
-        })
-        console.log('"""')
-        
-        console.log('タップ位置:', JSON.stringify(tapPosition,null,2));
-        console.log('キャンバスサイズ:', { width: canvas.width, height: canvas.height });
-        console.log('キャンバス作成完了');
-      })
-    }
-
-
-    } catch (err) {
-      console.error('Video click processing error:', err);
-      setError('画像キャプチャに失敗しました。');
-    }
-  }, [isStreaming]);
-
+  // --------------------------------------
+  // ✅ JSX
+  // --------------------------------------
   return (
-    <div className="w-full max-w-2xl mx-auto p-4">
-      <div className="relative">
-        <video
-          ref={videoRef}
-          className="w-full h-auto border rounded-lg"
-          playsInline
-          muted
-          autoPlay
-          onClick={handleVideoClick}
-        />
-
-        <h2 className="mt-4 text-lg font-semibold">
-          Scan Canvas
-        </h2>
-        <canvas ref={canvasRef} className="w-full h-auto border rounded-lg" />
-        <h2>
-          Result Canvas
-        </h2>
-        <canvas ref={resultCanvasRef} className="w-full h-auto border rounded-lg" />
-
-        {!isStreaming && !error && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-100 rounded-lg">
-            <p className="text-gray-500">カメラを起動中...</p>
-          </div>
-        )}
+    <div className="w-full max-w-3xl mx-auto p-4">
+      <div className="mb-4 flex items-center justify-between gap-2">
+        <h1 className="text-xl font-semibold">Out-Camera OCR</h1>
+        <div className="flex gap-2">
+          <button
+            onClick={startCamera}
+            disabled={isStarting || isRunning}
+            className={`px-4 py-2 rounded ${
+              isStarting || isRunning
+                ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                : "bg-blue-600 text-white hover:bg-blue-700"
+            }`}
+          >
+            {isStarting ? "起動中..." : "カメラ開始"}
+          </button>
+          <button
+            onClick={stopCamera}
+            disabled={!isRunning}
+            className={`px-4 py-2 rounded ${
+              !isRunning
+                ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                : "bg-rose-600 text-white hover:bg-rose-700"
+            }`}
+          >
+            カメラ停止
+          </button>
+        </div>
       </div>
-      
-      {error && (
-        <div className="mt-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded">
-          {error}
+
+      <div className="mb-3 text-sm text-gray-600">
+        <div>Recognizer: {recognizer ? "✅ ready" : "⏳ loading..."}</div>
+        <div>Camera: {isRunning ? "📷 起動中" : "⏸ 停止中"}</div>
+      </div>
+
+      {stream ? (
+        <WebGLCanvasCamera
+          stream={stream}
+          width={500}
+          height={500}
+          onTap={handleTap}
+          className="w-full h-auto"
+        />
+      ) : (
+        <div className="flex items-center justify-center h-48 text-gray-400">
+          カメラを開始してください
         </div>
       )}
 
-      <div className="mt-4 flex gap-2">
-        <button
-          onClick={startCamera}
-          disabled={isStreaming}
-          className={`px-4 py-2 rounded ${
-            isStreaming 
-              ? 'bg-gray-300 text-gray-500 cursor-not-allowed' 
-              : 'bg-green-500 text-white hover:bg-green-600'
-          }`}
-        >
-          カメラ開始
-        </button>
-        
-        <button
-          onClick={stopCamera}
-          disabled={!isStreaming}
-          className={`px-4 py-2 rounded ${
-            !isStreaming 
-              ? 'bg-gray-300 text-gray-500 cursor-not-allowed' 
-              : 'bg-red-500 text-white hover:bg-red-600'
-          }`}
-        >
-          カメラ停止
-        </button>
-      </div>
-
-      <div className="mt-2 text-sm text-gray-600">
-        ステータス: {isStreaming ? 'カメラ起動中' : 'カメラ停止中'}
+      <div className="mt-4">
+        <details className="bg-gray-50 rounded-md p-3">
+          <summary className="cursor-pointer select-none">
+            デバッグ: 直近の OCR 結果
+          </summary>
+          <pre className="mt-2 text-xs whitespace-pre-wrap break-words">
+            {lastResult
+              ? JSON.stringify(lastResult, null, 2)
+              : "（まだありません）"}
+          </pre>
+        </details>
       </div>
     </div>
+  );
+}
+
+/**
+ * ==========================================
+ * 親コンポーネント（Providerを維持）
+ * ==========================================
+ */
+export function CameraProvider() {
+  console.log("[CameraProvider] mount");
+
+  const modelPaths = useMemo(
+    () => ({
+      det_model_path: "https://ocr-file-server.pages.dev/ppocrv5/det/det.ort",
+      cls_model_path: "https://ocr-file-server.pages.dev/ppocrv5/cls/cls.ort",
+      rec_model_path: "https://ocr-file-server.pages.dev/ppocrv5/rec/rec.ort",
+      rec_char_dict_path:
+        "https://ocr-file-server.pages.dev/ppocrv5/ppocrv5_dict.txt",
+    }),
+    []
+  );
+  const onnx_wasm_path = useMemo(
+    () => "https://ocr-file-server.pages.dev/ort/",
+    []
+  );
+
+  return (
+    <ImageActionProvider
+      modelPaths={modelPaths}
+      onnx_wasm_path={onnx_wasm_path}
+      loadingComponent={
+        <div className="flex items-center justify-center min-h-[60vh]">
+          <div className="text-center">
+            <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4" />
+            <div className="text-gray-700">
+              OCR を初期化中です…（初回のみ時間がかかります）
+            </div>
+          </div>
+        </div>
+      }
+      errorComponent={(error) => (
+        <div className="flex items-center justify-center min-h-[60vh]">
+          <div className="max-w-md p-4 bg-white rounded-lg shadow border">
+            <h2 className="text-lg font-semibold text-rose-600 mb-2">
+              初期化エラー
+            </h2>
+            <p className="text-gray-700 mb-3">{error.message}</p>
+            <button
+              className="px-3 py-2 bg-rose-600 text-white rounded hover:bg-rose-700"
+              onClick={() => window.location.reload()}
+            >
+              リロード
+            </button>
+          </div>
+        </div>
+      )}
+    >
+      {/* ✅ Provider 内に残す */}
+      <CameraInner />
+    </ImageActionProvider>
   );
 }

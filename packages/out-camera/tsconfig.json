@@ -1,7 +1,6 @@
 {
   "extends": "@kyosan-map/typescript-config/react-library.json",
   "compilerOptions": {
-    "baseUrl": ".",
     "paths": {
       "@kyosan-map/out-camera/*": ["./src/*"]
     },

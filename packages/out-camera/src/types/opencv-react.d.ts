@@ -1,7 +1,8 @@
 declare module 'opencv-react' {
+  import type cvReadyPromise from "@techstark/opencv-js";
   interface OpenCvInstance {
     loaded: boolean;
-    cv: any; 
+    cv: Awaited<typeof cvReadyPromise>;
   }
 
   interface OpenCvProviderProps {

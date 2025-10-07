@@ -20,13 +20,17 @@
   },
   "dependencies": {
     "ismobilejs": "^1.1.1",
+    "onnx-ocr-js": "^0.0.5",
+    "onnxruntime-web": "^1.23.0",
     "opencv-react": "^0.0.6",
-    "tesseract.js": "^6.0.1"
+    "react-zoom-pan-pinch": "^3.7.0"
   },
   "exports": {
     "./lib/*": "./src/lib/*.ts",
     "./components/*": "./src/components/*.tsx",
     "./hooks/*": "./src/hooks/*.ts",
-    "./context/*": "./src/context/*.ts"
+    "./context/*": "./src/context/*.ts",
+    "./functions/*": "./src/functions/*.ts",
+    "./types/*": "./src/types/*.ts"
   }
 }
